@@ -402,17 +402,6 @@ defmodule EventStore.Subscriptions.SubscriptionFsm do
     next_state(state, data)
   end
 
-  # Handle flush_buffer in any state where it's not explicitly handled.
-  # This can happen if a timer fires while catching up or in other transitional states
-  # where flushing events isn't appropriate (e.g., during catch-up, events are being
-  # read from storage and will be sent via notify_subscribers when ready).
-  # Just clear the timer reference to prevent stale entries - events will be sent
-  # when the FSM transitions to an appropriate state (e.g., subscribed or max_capacity).
-  defevent flush_buffer(partition_key), data: %SubscriptionState{} = data, state: state do
-    data = clear_partition_timer(data, partition_key)
-    next_state(state, data)
-  end
-
   defp create_subscription(%SubscriptionState{} = data) do
     %SubscriptionState{
       conn: conn,

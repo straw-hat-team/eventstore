@@ -307,12 +307,11 @@ defmodule EventStore.Subscriptions.Subscription do
   defp handle_subscription_state(
          %Subscription{subscription: %SubscriptionFsm{state: :max_capacity}} = state
        ) do
-    Logger.debug(describe(state) <> " at max capacity, continuing to fetch new events")
+    Logger.debug(describe(state) <> " at max capacity, waiting for subscriber to ack")
 
-    # Even though subscriber is at capacity, continue fetching events from storage
-    # and queue them. When subscriber ACKs pending events, queued events will be sent.
-    :ok = GenServer.cast(self(), :catch_up)
-
+    # Subscriber is at capacity. New events arrive via PubSub notifications
+    # (notify_events) and are queued automatically. When subscriber ACKs pending
+    # events, queued events will be sent via notify_subscribers.
     state
   end
 
