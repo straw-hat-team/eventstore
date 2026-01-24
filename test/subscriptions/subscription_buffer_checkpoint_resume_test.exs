@@ -106,7 +106,6 @@ defmodule EventStore.Subscriptions.SubscriptionBufferCheckpointResumeTest do
 
       append_to_stream("stream1", 3)
       batch1 = collect_and_ack_events(subscription1, timeout: 1000)
-      Subscription.ack(subscription1, batch1)
 
       # Wait for checkpoint to write
       Process.sleep(200)
@@ -114,7 +113,6 @@ defmodule EventStore.Subscriptions.SubscriptionBufferCheckpointResumeTest do
       # Append more while still subscribed
       append_to_stream("stream1", 3, 3)
       batch2 = collect_and_ack_events(subscription1, timeout: 1000)
-      Subscription.ack(subscription1, batch2)
 
       all_numbers_before_unsubscribe =
         (Enum.map(batch1, & &1.event_number) ++ Enum.map(batch2, & &1.event_number))

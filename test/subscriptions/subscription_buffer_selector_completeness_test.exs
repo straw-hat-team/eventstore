@@ -145,14 +145,13 @@ defmodule EventStore.Subscriptions.SubscriptionBufferSelectorCompletenessTest do
 
       # Global event_number filter > 2 means we filter by global event number
       # s1: events 1,2,3  s2: events 4,5,6  s3: events 7,8,9
-      # So selector filters out 1,2 and keeps 3,4,5,6,7,8,9 = 7 events
-      # But since we're collecting by ordering, we get events 3-9 = 7 events
-      assert length(events) in [6, 7, 8]
+      # Selector filters out events with event_number <= 2, keeping 3,4,5,6,7,8,9 = 7 events
+      assert length(events) == 7, "Should receive exactly 7 events (event_number 3-9)"
 
       # Verify selector filtered out event_number <= 2
       nums = Enum.map(events, & &1.event_number)
-      # At least some should be > 2
-      assert Enum.any?(nums, &(&1 > 2)), "Should have some events > 2"
+      assert Enum.all?(nums, &(&1 > 2)), "All events should have event_number > 2"
+      assert Enum.sort(nums) == [3, 4, 5, 6, 7, 8, 9]
     end
   end
 

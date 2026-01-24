@@ -347,9 +347,9 @@ defmodule EventStore.Subscriptions.SubscriptionBufferEdgeCasesTest do
 
       assert length(events) == 500
 
-      # Verify sequence integrity
+      # Verify sequence integrity - all 500 events in order
       nums = Enum.map(events, & &1.event_number)
-      assert Enum.uniq(nums) == Enum.sort(Enum.uniq(nums))
+      assert nums == Enum.to_list(1..500), "Events should be in sequence 1..500"
     end
 
     test "recovery from slow processing" do

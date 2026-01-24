@@ -88,7 +88,8 @@ defmodule EventStore.Subscriptions.SubscriptionBufferLargeScaleTest do
 
       events = collect_and_ack_events(subscription, timeout: 3000)
 
-      # Total should be: 6*5 + 5*4 + 5*3 + 5*2 + 5*1 = 30+20+15+10+5 = 80
+      # rem(i, 5) + 1 for i in 1..30 gives pattern [2,3,4,5,1] repeated 6 times
+      # Sum per cycle: 2+3+4+5+1 = 15, Total: 6 * 15 = 90
       expected_total = Enum.sum(Enum.map(1..30, fn i -> rem(i, 5) + 1 end))
       assert length(events) == expected_total
 
