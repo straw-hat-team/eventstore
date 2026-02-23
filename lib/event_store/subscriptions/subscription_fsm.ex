@@ -769,6 +769,30 @@ defmodule EventStore.Subscriptions.SubscriptionFsm do
     end
   end
 
+  # Checkpoint acknowledgement
+  #
+  # This function advances the subscription checkpoint based on acknowledged events.
+  # CRITICAL: Checkpoints must advance in GLOBAL EVENT ORDER, not partition order!
+  #
+  # Why global ordering?
+  # - Events have a global event_number from the event store (e.g., 100, 101, 102, ...)
+  # - On subscription restart, we must resume from a single, consistent position
+  # - We cannot checkpoint event #102 until events #100 and #101 are acknowledged,
+  #   even if they came from different partitions that flushed at different times
+  #
+  # Algorithm:
+  # 1. Walk through in_flight_event_numbers in order (sorted by event_number)
+  # 2. Advance last_ack as far as possible (contiguous acknowledged events)
+  # 3. Stop when we hit an un-acknowledged event (creating a "gap")
+  # 4. Persist checkpoint when threshold reached or timer fires
+  #
+  # Example:
+  #   in_flight_event_numbers: [100, 101, 102, 103, 104]
+  #   acknowledged_event_numbers: [100, 101, 102, 104]  # 103 missing!
+  #   Result: last_ack = 102 (cannot advance past the gap at 103)
+  #
+  # This ensures that on restart, we never replay the same event twice or miss events.
+
   defp checkpoint_acknowledged(data, persist \\ false)
 
   defp checkpoint_acknowledged(%SubscriptionState{in_flight_event_numbers: []} = data, persist) do
@@ -871,6 +895,22 @@ defmodule EventStore.Subscriptions.SubscriptionFsm do
     do: "Subscription #{inspect(name)}@#{inspect(stream_uuid)}"
 
   # Buffer flush timer management
+  #
+  # Each partition maintains its own independent timer to ensure bounded latency
+  # delivery even during low-traffic periods. This prevents high-frequency partitions
+  # from starving low-frequency partitions.
+  #
+  # Timer lifecycle:
+  # 1. Timer starts when the first event is enqueued to a new partition
+  # 2. Timer is cancelled when the partition empties (all events sent)
+  # 3. Timer is cleared (not cancelled) when it fires and sends :flush_buffer
+  # 4. Timer is restarted if events remain after a flush attempt (subscriber at capacity)
+  #
+  # Why per-partition timers?
+  # - Without them, a high-volume partition could reset a global timer repeatedly,
+  #   preventing low-volume partitions from ever timing out
+  # - Each partition gets its own bounded latency guarantee
+  # - Aligns with partition independence semantics
 
   # Start a timer for a partition if buffer_flush_after is configured and no timer exists
   defp maybe_start_partition_timer(
@@ -930,9 +970,27 @@ defmodule EventStore.Subscriptions.SubscriptionFsm do
     end)
   end
 
-  # Flush a partition when the buffer timeout fires.
-  # Attempts to send queued events to available subscribers. If events remain
-  # (e.g., subscriber at capacity), the timer is restarted to ensure bounded latency.
+  # Flush a partition when the buffer timeout fires
+  #
+  # This is called when a partition's buffer_flush_after timer expires.
+  # It ensures events are delivered with bounded latency even if the buffer_size
+  # hasn't been reached.
+  #
+  # Behavior:
+  # 1. Attempts to send queued events to available subscribers
+  # 2. If subscriber is at capacity, events remain queued
+  # 3. If events remain after flush attempt, timer is automatically restarted
+  # 4. This guarantees eventual delivery with bounded latency
+  #
+  # Example scenario:
+  #   buffer_size: 100, buffer_flush_after: 5000
+  #   - 10 events arrive in partition A
+  #   - Timer fires after 5 seconds
+  #   - If subscriber available: Send 10 events (timer not restarted)
+  #   - If subscriber at capacity: Events stay queued, timer restarts for another 5s
+  #
+  # This ensures that no event waits longer than buffer_flush_after milliseconds
+  # in the buffer, providing predictable latency guarantees.
   defp flush_partition_on_timeout(%SubscriptionState{} = data, partition_key) do
     %SubscriptionState{partitions: partitions} = data
 

@@ -269,7 +269,7 @@ By default a subscription will only allow a single subscriber but you can opt-in
 
 - `buffer_size` limits how many in-flight events will be sent to the subscriber process before acknowledgement of successful processing. This limits the number of messages sent to the subscriber and stops their message queue from getting filled with events. Defaults to one in-flight event.
 
-- `buffer_flush_after` (milliseconds) ensures events are flushed to the subscriber after a period of time even if the buffer size has not been reached. This ensures events are delivered with bounded latency during less busy periods. When set to 0 (default), no time-based flushing is performed and events are only sent when the buffer_size is reached. Each partition has its own independent timer. If a subscriber is at capacity when the timer fires, events remain queued and the timer is automatically restarted to ensure eventual delivery with bounded latency.
+- `buffer_flush_after` (milliseconds) ensures events are flushed to the subscriber after a period of time even if the buffer size has not been reached. This ensures events are delivered with bounded latency during less busy periods. When set to 0 (default), no time-based flushing is performed and events are only sent when the buffer_size is reached. Each partition has its own independent timer. If a subscriber is at capacity when the timer fires, events remain queued and the timer is automatically restarted to ensure eventual delivery with bounded latency. See [Buffer Flush Behavior](#buffer-flush-behavior) for detailed information.
 
 - `partition_by` is an optional function used to partition events to subscribers. It can be used to guarantee processing order when multiple subscribers have subscribed to a single subscription as described in [Ordering guarantee](#ordering-guarantee) below. The function is passed a single argument (an `EventStore.RecordedEvent` struct) and must return the partition key. As an example to guarantee events for a single stream are processed serially, but different streams are processed concurrently, you could use the `stream_uuid` as the partition key.
 
@@ -350,6 +350,182 @@ Start your subscriber process, which subscribes to all streams in the event stor
 
 ```elixir
 {:ok, subscriber} = Subscriber.start_link()
+```
+
+## Buffer Flush Behavior
+
+The `buffer_flush_after` option provides bounded latency guarantees for event delivery by automatically flushing buffered events after a timeout period. This is particularly useful when using `buffer_size > 1` for throughput optimization but still requiring predictable latency during low-traffic periods.
+
+### How It Works
+
+#### Without `buffer_flush_after`
+
+```elixir
+{:ok, subscription} = 
+  EventStore.subscribe_to_all_streams("my_sub", self(), 
+    buffer_size: 100
+  )
+```
+
+**Behavior:**
+- Events are buffered until 100 events accumulate
+- During high traffic: ✅ Batches flush quickly (good throughput)
+- During low traffic: ❌ Events wait indefinitely for the 100th event
+- **Problem:** Read models can become stale during quiet periods
+
+#### With `buffer_flush_after`
+
+```elixir
+{:ok, subscription} = 
+  EventStore.subscribe_to_all_streams("my_sub", self(), 
+    buffer_size: 100,
+    buffer_flush_after: 5_000  # 5 seconds
+  )
+```
+
+**Behavior:**
+- Events are buffered until 100 events **OR** 5 seconds, whichever comes first
+- During high traffic: ✅ Batches flush when full (good throughput)
+- During low traffic: ✅ Partial batches flush after 5s (bounded latency)
+- **Result:** Predictable latency regardless of traffic patterns
+
+### Per-Partition Timers
+
+When using `partition_by`, each partition maintains its own independent timer:
+
+```elixir
+{:ok, subscription} = 
+  EventStore.subscribe_to_all_streams("my_sub", self(),
+    buffer_size: 100,
+    buffer_flush_after: 5_000,
+    partition_by: fn event -> event.stream_uuid end
+  )
+```
+
+**Why per-partition timers are necessary:**
+
+Consider a scenario with different traffic patterns per partition:
+- Stream A: 1000 events/second (high volume)
+- Stream B: 1 event/minute (low volume)
+
+**With per-partition timers (current design):**
+- Stream A: Buffer fills quickly → flushes on `buffer_size`
+- Stream B: Buffer doesn't fill → timer fires after 5s → flushes partial batch
+- ✅ Both streams get timely delivery
+
+**Without per-partition timers (hypothetical):**
+- Stream A: Buffer fills quickly → flushes → **resets global timer**
+- Stream B: Waits for global timer → **but Stream A keeps resetting it!**
+- ❌ Stream B's events never time out → stale data
+
+### Acknowledgement and Checkpointing
+
+**Important:** While partitions have independent flush timers, acknowledgements and checkpoints respect **global event ordering**.
+
+#### The Flow
+
+1. **Events arrive** across multiple partitions:
+   ```
+   Stream-A: Event #100, #101, #104
+   Stream-B: Event #102
+   Stream-C: Event #103
+   ```
+
+2. **Per-partition timers** control when events are sent to subscribers:
+   ```
+   T=0s:  All events buffered
+   T=5s:  Stream-B timer fires → Event #102 sent to subscriber
+   T=5.1s: Stream-A timer fires → Events #100, #101, #104 sent
+   T=10s: Stream-C timer fires → Event #103 sent
+   ```
+
+3. **Subscriber acknowledges** events:
+   ```elixir
+   # Subscriber receives Stream-B events first (due to timer)
+   {:events, [event_102]} -> :ok = EventStore.ack(subscription, event_102)
+   
+   # Then Stream-A events
+   {:events, [event_100, event_101, event_104]} -> 
+     :ok = EventStore.ack(subscription, event_104)  # ACKs all in batch
+   
+   # Finally Stream-C events
+   {:events, [event_103]} -> :ok = EventStore.ack(subscription, event_103)
+   ```
+
+4. **Checkpoint advances** in global event order:
+   ```
+   After ACK 102: Checkpoint cannot advance (event 100 not ACK'd yet)
+   After ACK 104: Checkpoint advances to 102 (100, 101, 102 all ACK'd)
+   After ACK 103: Checkpoint advances to 104 (all events ACK'd)
+   ```
+
+**Key insight:** Events from different partitions can be **delivered at different times**, but the checkpoint always advances in **global event number order** to ensure consistent replay on restart.
+
+### Use Cases
+
+#### Read Model Projections with Batching
+
+```elixir
+defmodule MyApp.ReadModelProjector do
+  use Commanded.Event.Handler,
+    application: MyApp,
+    name: __MODULE__,
+    batch_size: 1000,  # Batch for database performance
+    buffer_flush_after: 5_000  # But don't wait forever
+
+  def handle_batch(events) do
+    Repo.transaction(fn ->
+      # Insert 1000 events efficiently
+      Enum.each(events, &insert_into_read_model/1)
+    end)
+    :ok
+  end
+end
+```
+
+**Benefits:**
+- High traffic: Efficient 1000-event batches
+- Low traffic: Events still delivered within 5 seconds
+- Predictable read model freshness
+
+#### Per-Stream Processing with Variable Traffic
+
+```elixir
+{:ok, subscription} = 
+  EventStore.subscribe_to_all_streams("processor", self(),
+    buffer_size: 50,
+    buffer_flush_after: 3_000,
+    partition_by: fn event -> event.stream_uuid end,
+    concurrency_limit: 10
+  )
+```
+
+**Benefits:**
+- Each stream processed independently
+- High-volume streams don't block low-volume streams
+- All streams get 3-second latency guarantee
+
+### Configuration Guidelines
+
+**Choose `buffer_size` based on throughput needs:**
+- `buffer_size: 1` (default) - Lowest latency, no batching needed
+- `buffer_size: 10-100` - Good balance for most use cases
+- `buffer_size: 1000+` - High-throughput batch processing
+
+**Choose `buffer_flush_after` based on latency requirements:**
+- `buffer_flush_after: 0` (default) - No timeout (only flush on buffer_size)
+- `buffer_flush_after: 1_000` - 1 second max latency (real-time systems)
+- `buffer_flush_after: 5_000` - 5 second max latency (typical read models)
+- `buffer_flush_after: 30_000` - 30 second max latency (background processing)
+
+**Rule of thumb:**
+```elixir
+# If you set buffer_size > 1, you probably want buffer_flush_after too
+{:ok, subscription} = 
+  EventStore.subscribe_to_all_streams("my_sub", self(),
+    buffer_size: 100,
+    buffer_flush_after: 5_000  # Don't let events sit indefinitely!
+  )
 ```
 
 ### Deleting a persistent subscription
