@@ -3,11 +3,10 @@ defmodule EventStore.Subscriptions.SubscriptionBufferFlushDiagnosticsTest do
   Diagnostic tests to understand buffer_flush_after behavior
   """
   use EventStore.StorageCase
+  import EventStore.SubscriptionHelpers
   @moduletag :manual
 
-  alias EventStore.{EventFactory, UUID}
   alias EventStore.Subscriptions.Subscription
-  alias TestEventStore, as: EventStore
 
   describe "diagnostic - timer firing in max_capacity" do
     test "verify timer fires when at max_capacity" do
@@ -128,20 +127,6 @@ defmodule EventStore.Subscriptions.SubscriptionBufferFlushDiagnosticsTest do
   end
 
   # Helper functions
-
-  defp subscribe_to_all_streams(opts) do
-    subscription_name = UUID.uuid4()
-    {:ok, subscription} = EventStore.subscribe_to_all_streams(subscription_name, self(), opts)
-
-    assert_receive {:subscribed, ^subscription}
-
-    {:ok, subscription}
-  end
-
-  defp append_to_stream(stream_uuid, event_count, expected_version \\ 0) do
-    events = EventFactory.create_events(event_count, expected_version + 1)
-    :ok = EventStore.append_to_stream(stream_uuid, expected_version, events)
-  end
 
   defp get_subscription_state(subscription_pid) do
     subscription_struct = :sys.get_state(subscription_pid)

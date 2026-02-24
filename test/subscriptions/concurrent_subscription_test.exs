@@ -899,15 +899,6 @@ defmodule EventStore.Subscriptions.ConcurrentSubscriptionTest do
     assert received_numbers == Enum.to_list(expected_range)
   end
 
-  defp assert_per_stream_order(events) do
-    events
-    |> Enum.group_by(& &1.stream_uuid)
-    |> Enum.each(fn {_stream_uuid, stream_events} ->
-      numbers = Enum.map(stream_events, & &1.event_number)
-      assert numbers == Enum.sort(numbers)
-    end)
-  end
-
   defp assert_last_ack(subscription, expected_ack) do
     last_seen = Subscription.last_seen(subscription)
 

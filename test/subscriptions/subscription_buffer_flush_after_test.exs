@@ -1,7 +1,8 @@
 defmodule EventStore.Subscriptions.SubscriptionBufferFlushAfterTest do
   use EventStore.StorageCase
+  import EventStore.SubscriptionHelpers
 
-  alias EventStore.{EventFactory, UUID}
+  alias EventStore.UUID
   alias EventStore.Subscriptions.Subscription
   alias TestEventStore, as: EventStore
 
@@ -727,26 +728,6 @@ defmodule EventStore.Subscriptions.SubscriptionBufferFlushAfterTest do
 
   # Helper functions
 
-  defp subscribe_to_all_streams(opts) do
-    subscription_name = UUID.uuid4()
-    {:ok, subscription} = EventStore.subscribe_to_all_streams(subscription_name, self(), opts)
-
-    assert_receive {:subscribed, ^subscription}
-
-    {:ok, subscription}
-  end
-
-  defp append_to_stream(stream_uuid, event_count, expected_version \\ 0) do
-    events = EventFactory.create_events(event_count, expected_version + 1)
-
-    :ok = EventStore.append_to_stream(stream_uuid, expected_version, events)
-  end
-
-  defp assert_event_numbers(events, expected_numbers) do
-    actual_numbers = Enum.map(events, & &1.event_number)
-    assert actual_numbers == expected_numbers
-  end
-
   defp receive_all_events(acc) do
     receive do
       {:events, events} ->
@@ -757,21 +738,4 @@ defmodule EventStore.Subscriptions.SubscriptionBufferFlushAfterTest do
     end
   end
 
-  defp start_subscriber do
-    reply_to = self()
-
-    spawn_link(fn -> subscriber_loop(reply_to) end)
-  end
-
-  defp subscriber_loop(reply_to) do
-    receive do
-      {:subscribed, subscription} ->
-        send(reply_to, {:subscribed, subscription, self()})
-
-      {:events, events} ->
-        send(reply_to, {:events, events, self()})
-    end
-
-    subscriber_loop(reply_to)
-  end
 end

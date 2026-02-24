@@ -51,15 +51,12 @@ defmodule EventStore.Subscriptions.SubscriptionState do
     }
   end
 
-  # Cancel all buffer flush timers.
-  # Note: Process.cancel_timer may return false if the timer already fired,
-  # which is harmless and can be safely ignored.
   def cancel_all_buffer_timers(%SubscriptionState{buffer_timers: buffer_timers} = state) do
     Enum.each(buffer_timers, fn {_partition_key, timer_ref} ->
       Process.cancel_timer(timer_ref)
     end)
 
-    state
+    %SubscriptionState{state | buffer_timers: %{}}
   end
 
   def track_in_flight(%SubscriptionState{} = state, event_number) when is_number(event_number) do

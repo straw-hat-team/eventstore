@@ -11,8 +11,9 @@ defmodule EventStore.Subscriptions.SubscriptionBufferCheckpointResumeTest do
   6. Multiple checkpoint cycles work correctly
   """
   use EventStore.StorageCase
+  import EventStore.SubscriptionHelpers
 
-  alias EventStore.{EventFactory, UUID}
+  alias EventStore.UUID
   alias EventStore.Subscriptions.Subscription
   alias TestEventStore, as: EventStore
 
@@ -353,34 +354,4 @@ defmodule EventStore.Subscriptions.SubscriptionBufferCheckpointResumeTest do
     end
   end
 
-  # Helpers
-
-  defp append_to_stream(stream_uuid, event_count, expected_version \\ 0) do
-    events = EventFactory.create_events(event_count, expected_version + 1)
-    :ok = EventStore.append_to_stream(stream_uuid, expected_version, events)
-  end
-
-  defp collect_and_ack_events(subscription_pid, timeout: timeout) do
-    collect_and_ack_with_timeout(subscription_pid, [], timeout)
-  end
-
-  defp collect_and_ack_with_timeout(_subscription_pid, acc, remaining_timeout)
-       when remaining_timeout <= 0 do
-    acc
-  end
-
-  defp collect_and_ack_with_timeout(subscription_pid, acc, remaining_timeout) do
-    start = System.monotonic_time(:millisecond)
-
-    receive do
-      {:events, events} ->
-        :ok = Subscription.ack(subscription_pid, events)
-        elapsed = System.monotonic_time(:millisecond) - start
-        new_timeout = remaining_timeout - elapsed
-        collect_and_ack_with_timeout(subscription_pid, acc ++ events, new_timeout)
-    after
-      min(remaining_timeout, 200) ->
-        acc
-    end
-  end
 end

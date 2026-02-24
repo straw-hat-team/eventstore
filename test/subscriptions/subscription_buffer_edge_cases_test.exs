@@ -11,10 +11,9 @@ defmodule EventStore.Subscriptions.SubscriptionBufferEdgeCasesTest do
   6. Rapid state transitions
   """
   use EventStore.StorageCase
+  import EventStore.SubscriptionHelpers
 
-  alias EventStore.{EventFactory, UUID}
   alias EventStore.Subscriptions.Subscription
-  alias TestEventStore, as: EventStore
 
   describe "exact boundary conditions" do
     test "buffer_size == event count" do
@@ -383,41 +382,4 @@ defmodule EventStore.Subscriptions.SubscriptionBufferEdgeCasesTest do
     end
   end
 
-  # Helpers
-
-  defp subscribe_to_all_streams(opts) do
-    subscription_name = UUID.uuid4()
-    {:ok, subscription} = EventStore.subscribe_to_all_streams(subscription_name, self(), opts)
-    assert_receive {:subscribed, ^subscription}
-    {:ok, subscription}
-  end
-
-  defp append_to_stream(stream_uuid, event_count, expected_version \\ 0) do
-    events = EventFactory.create_events(event_count, expected_version + 1)
-    :ok = EventStore.append_to_stream(stream_uuid, expected_version, events)
-  end
-
-  defp collect_and_ack_events(subscription_pid, timeout: timeout) do
-    collect_and_ack_with_timeout(subscription_pid, [], timeout)
-  end
-
-  defp collect_and_ack_with_timeout(_subscription_pid, acc, remaining_timeout)
-       when remaining_timeout <= 0 do
-    acc
-  end
-
-  defp collect_and_ack_with_timeout(subscription_pid, acc, remaining_timeout) do
-    start = System.monotonic_time(:millisecond)
-
-    receive do
-      {:events, events} ->
-        :ok = Subscription.ack(subscription_pid, events)
-        elapsed = System.monotonic_time(:millisecond) - start
-        new_timeout = remaining_timeout - elapsed
-        collect_and_ack_with_timeout(subscription_pid, acc ++ events, new_timeout)
-    after
-      min(remaining_timeout, 200) ->
-        acc
-    end
-  end
 end

@@ -268,10 +268,8 @@ defmodule EventStore.Subscriptions.Subscription do
     %Subscription{subscription: subscription} = state
     %SubscriptionFsm{data: subscription_data} = subscription
 
-    # Cancel all buffer flush timers before terminating
     SubscriptionState.cancel_all_buffer_timers(subscription_data)
 
-    # Checkpoint subscription if needed before terminating
     SubscriptionFsm.checkpoint(subscription)
 
     state
@@ -309,9 +307,6 @@ defmodule EventStore.Subscriptions.Subscription do
        ) do
     Logger.debug(describe(state) <> " at max capacity, waiting for subscriber to ack")
 
-    # Subscriber is at capacity. New events arrive via PubSub notifications
-    # (notify_events) and are queued automatically. When subscriber ACKs pending
-    # events, queued events will be sent via notify_subscribers.
     state
   end
 
