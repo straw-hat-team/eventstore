@@ -138,6 +138,18 @@ defmodule EventStore.Subscriptions.Subscription do
   end
 
   @impl GenServer
+  def handle_info({:flush_buffer, partition_key}, %Subscription{} = state) do
+    %Subscription{subscription: subscription} = state
+
+    state =
+      subscription
+      |> SubscriptionFsm.flush_buffer(partition_key)
+      |> apply_subscription_to_state(state)
+
+    {:noreply, state}
+  end
+
+  @impl GenServer
   def handle_info(
         {EventStore.AdvisoryLocks, :lock_released, lock_ref, reason},
         %Subscription{} = state
@@ -254,8 +266,10 @@ defmodule EventStore.Subscriptions.Subscription do
   @impl GenServer
   def terminate(_reason, state) do
     %Subscription{subscription: subscription} = state
+    %SubscriptionFsm{data: subscription_data} = subscription
 
-    # Checkpoint subscription if needed before terminating
+    SubscriptionState.cancel_all_buffer_timers(subscription_data)
+
     SubscriptionFsm.checkpoint(subscription)
 
     state
@@ -291,6 +305,8 @@ defmodule EventStore.Subscriptions.Subscription do
   defp handle_subscription_state(
          %Subscription{subscription: %SubscriptionFsm{state: :max_capacity}} = state
        ) do
+    Logger.debug(describe(state) <> " at max capacity, waiting for subscriber to ack")
+
     state
   end
 

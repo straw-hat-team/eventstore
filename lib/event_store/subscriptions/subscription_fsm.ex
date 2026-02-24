@@ -7,8 +7,6 @@ defmodule EventStore.Subscriptions.SubscriptionFsm do
 
   use Fsm, initial_state: :initial, initial_data: %SubscriptionState{}
 
-  require Logger
-
   def new(stream_uuid, subscription_name, opts) do
     new(
       data: %SubscriptionState{
@@ -23,6 +21,7 @@ defmodule EventStore.Subscriptions.SubscriptionFsm do
         selector: opts[:selector],
         partition_by: opts[:partition_by],
         buffer_size: opts[:buffer_size] || 1,
+        buffer_flush_after: opts[:buffer_flush_after] || 0,
         checkpoint_after: opts[:checkpoint_after] || 0,
         checkpoint_threshold: opts[:checkpoint_threshold] || 1,
         query_timeout: opts[:query_timeout] || 15_000,
@@ -109,6 +108,11 @@ defmodule EventStore.Subscriptions.SubscriptionFsm do
     defevent checkpoint(), data: %SubscriptionState{} = data do
       next_state(:subscribed, persist_checkpoint(data))
     end
+
+    defevent flush_buffer(partition_key), data: %SubscriptionState{} = data do
+      data = clear_partition_timer(data, partition_key)
+      next_state(:request_catch_up, data)
+    end
   end
 
   defstate catching_up do
@@ -123,44 +127,31 @@ defmodule EventStore.Subscriptions.SubscriptionFsm do
     defevent checkpoint(), data: %SubscriptionState{} = data do
       next_state(:subscribed, persist_checkpoint(data))
     end
+
+    defevent flush_buffer(partition_key), data: %SubscriptionState{} = data do
+      data = clear_partition_timer(data, partition_key)
+      next_state(:catching_up, data)
+    end
   end
 
   defstate subscribed do
-    # Notify events when subscribed
     defevent notify_events(events), data: %SubscriptionState{} = data do
-      %SubscriptionState{last_received: last_received} = data
-
-      expected_event = last_received + 1
-
-      case first_event_number(events) do
-        past when past < expected_event ->
-          Logger.debug(describe(data) <> " received past event(s), ignoring")
-
-          # Ignore already seen events
+      case validate_event_continuity(data, events) do
+        :past ->
           next_state(:subscribed, data)
 
-        future when future > expected_event ->
-          Logger.debug(describe(data) <> " received unexpected event(s), requesting catch up")
-
-          # Missed event(s), request catch-up with any unseen events from storage
+        :future ->
           next_state(:request_catch_up, data)
 
-        ^expected_event ->
-          Logger.debug(describe(data) <> " is enqueueing #{length(events)} event(s)")
-
-          # Subscriber is up-to-date, so enqueue events to send
+        :expected ->
           data =
             data
             |> enqueue_events(events)
             |> notify_subscribers()
 
-          if over_capacity?(data) do
-            # Too many pending events, must wait for these to be processed.
-            next_state(:max_capacity, data)
-          else
-            # Remain subscribed, waiting for subscriber to ack already sent events.
-            next_state(:subscribed, data)
-          end
+          if over_capacity?(data),
+            do: next_state(:max_capacity, data),
+            else: next_state(:subscribed, data)
       end
     end
 
@@ -179,16 +170,38 @@ defmodule EventStore.Subscriptions.SubscriptionFsm do
     defevent checkpoint(), data: %SubscriptionState{} = data do
       next_state(:subscribed, persist_checkpoint(data))
     end
+
+    defevent flush_buffer(partition_key), data: %SubscriptionState{} = data do
+      data =
+        data
+        |> clear_partition_timer(partition_key)
+        |> flush_partition_on_timeout(partition_key)
+
+      next_state(:subscribed, data)
+    end
   end
 
   defstate max_capacity do
+    defevent notify_events(events), data: %SubscriptionState{} = data do
+      case validate_event_continuity(data, events) do
+        :past ->
+          next_state(:max_capacity, data)
+
+        :future ->
+          next_state(:request_catch_up, data)
+
+        :expected ->
+          data = enqueue_events(data, events)
+          next_state(:max_capacity, data)
+      end
+    end
+
     defevent ack(ack, subscriber), data: %SubscriptionState{} = data do
       with {:ok, data} <- ack_events(data, ack, subscriber) do
         if empty_queue?(data) do
-          # No further pending events so catch up with any unseen.
           next_state(:request_catch_up, data)
         else
-          # Pending events remain, wait until subscriber ack's.
+          data = restart_timers_for_pending_partitions(data)
           next_state(:max_capacity, data)
         end
       else
@@ -198,6 +211,21 @@ defmodule EventStore.Subscriptions.SubscriptionFsm do
 
     defevent checkpoint(), data: %SubscriptionState{} = data do
       next_state(:subscribed, persist_checkpoint(data))
+    end
+
+    defevent flush_buffer(partition_key), data: %SubscriptionState{} = data do
+      data =
+        data
+        |> clear_partition_timer(partition_key)
+        |> flush_partition_on_timeout(partition_key)
+
+      data =
+        case Map.get(data.partitions, partition_key) do
+          nil -> data
+          _remaining_events -> maybe_start_partition_timer(data, partition_key)
+        end
+
+      next_state(:max_capacity, data)
     end
   end
 
@@ -270,6 +298,13 @@ defmodule EventStore.Subscriptions.SubscriptionFsm do
   end
 
   defevent catch_up, data: %SubscriptionState{} = data, state: state do
+    next_state(state, data)
+  end
+
+  # Catch-all for flush_buffer in any unhandled state.
+  # Clear the timer and remain in the current state.
+  defevent flush_buffer(partition_key), data: %SubscriptionState{} = data, state: state do
+    data = clear_partition_timer(data, partition_key)
     next_state(state, data)
   end
 
@@ -407,6 +442,16 @@ defmodule EventStore.Subscriptions.SubscriptionFsm do
     |> SubscriptionState.track_in_flight(event_number)
   end
 
+  defp validate_event_continuity(%SubscriptionState{last_received: last_received}, events) do
+    expected_event = last_received + 1
+
+    case first_event_number(events) do
+      past when past < expected_event -> :past
+      future when future > expected_event -> :future
+      ^expected_event -> :expected
+    end
+  end
+
   defp first_event_number([%RecordedEvent{event_number: event_number} | _]), do: event_number
 
   defp last_event_number([%RecordedEvent{event_number: event_number}]), do: event_number
@@ -496,13 +541,20 @@ defmodule EventStore.Subscriptions.SubscriptionFsm do
     %SubscriptionState{partitions: partitions, queue_size: queue_size} = data
 
     partition_key = partition_key(data, event)
+    is_new_partition = not Map.has_key?(partitions, partition_key)
 
     partitions =
       partitions
       |> Map.put_new(partition_key, :queue.new())
       |> Map.update!(partition_key, fn pending_events -> enqueue.(event, pending_events) end)
 
-    %SubscriptionState{data | partitions: partitions, queue_size: queue_size + 1}
+    data = %SubscriptionState{data | partitions: partitions, queue_size: queue_size + 1}
+
+    if is_new_partition do
+      maybe_start_partition_timer(data, partition_key)
+    else
+      data
+    end
   end
 
   def partition_key(%SubscriptionState{partition_by: nil}, %RecordedEvent{}), do: nil
@@ -545,20 +597,25 @@ defmodule EventStore.Subscriptions.SubscriptionFsm do
 
       subscriber = Subscriber.track_in_flight(subscriber, event, partition_key)
 
-      partitions =
+      {partitions, partition_emptied} =
         case :queue.is_empty(pending_events) do
-          true -> Map.delete(partitions, partition_key)
-          false -> Map.put(partitions, partition_key, pending_events)
+          true -> {Map.delete(partitions, partition_key), true}
+          false -> {Map.put(partitions, partition_key, pending_events), false}
         end
 
-      %SubscriptionState{
-        data
-        | partitions: partitions,
-          subscribers: Map.put(subscribers, subscriber_pid, subscriber),
-          queue_size: max(queue_size - 1, 0)
-      }
-      |> track_sent(event_number)
-      |> notify_partition_subscriber(partition_key, [{subscriber_pid, event} | events_to_send])
+      data =
+        %SubscriptionState{
+          data
+          | partitions: partitions,
+            subscribers: Map.put(subscribers, subscriber_pid, subscriber),
+            queue_size: max(queue_size - 1, 0)
+        }
+        |> track_sent(event_number)
+
+      # Cancel the timer when the partition becomes empty
+      data = if partition_emptied, do: cancel_partition_timer(data, partition_key), else: data
+
+      notify_partition_subscriber(data, partition_key, [{subscriber_pid, event} | events_to_send])
     else
       _ ->
         # No further queued event or available subscriber, send ready events to
@@ -604,8 +661,9 @@ defmodule EventStore.Subscriptions.SubscriptionFsm do
         subscriber -> [subscriber]
       end
 
+    # pid tiebreaker ensures deterministic subscriber selection when last_sent values are equal
     subscribers
-    |> Enum.sort_by(fn {_pid, %Subscriber{last_sent: last_sent}} -> last_sent end)
+    |> Enum.sort_by(fn {pid, %Subscriber{last_sent: last_sent}} -> {last_sent, pid} end)
     |> Enum.find(fn {_pid, subscriber} -> Subscriber.available?(subscriber) end)
     |> case do
       nil -> {:error, :no_available_subscriber}
@@ -655,6 +713,9 @@ defmodule EventStore.Subscriptions.SubscriptionFsm do
     end
   end
 
+  # Checkpoints must advance in global event order, not partition order, because on
+  # restart we resume from a single position. We cannot checkpoint event N until all
+  # events before N are acknowledged, even across different partitions.
   defp checkpoint_acknowledged(data, persist \\ false)
 
   defp checkpoint_acknowledged(%SubscriptionState{in_flight_event_numbers: []} = data, persist) do
@@ -753,6 +814,68 @@ defmodule EventStore.Subscriptions.SubscriptionFsm do
   defp over_capacity?(%SubscriptionState{queue_size: queue_size, max_size: max_size}),
     do: queue_size >= max_size
 
-  defp describe(%SubscriptionState{stream_uuid: stream_uuid, subscription_name: name}),
-    do: "Subscription #{inspect(name)}@#{inspect(stream_uuid)}"
+  # Per-partition timers ensure bounded latency delivery independently per partition,
+  # preventing high-frequency partitions from starving low-frequency ones.
+  defp maybe_start_partition_timer(
+         %SubscriptionState{buffer_flush_after: 0} = data,
+         _partition_key
+       ),
+       do: data
+
+  defp maybe_start_partition_timer(%SubscriptionState{} = data, partition_key) do
+    %SubscriptionState{buffer_flush_after: buffer_flush_after, buffer_timers: buffer_timers} =
+      data
+
+    if Map.has_key?(buffer_timers, partition_key) do
+      # Timer already exists for this partition
+      data
+    else
+      # Start a new timer for this partition
+      timer_ref = Process.send_after(self(), {:flush_buffer, partition_key}, buffer_flush_after)
+      %SubscriptionState{data | buffer_timers: Map.put(buffer_timers, partition_key, timer_ref)}
+    end
+  end
+
+  defp cancel_partition_timer(%SubscriptionState{} = data, partition_key) do
+    %SubscriptionState{buffer_timers: buffer_timers} = data
+
+    case Map.get(buffer_timers, partition_key) do
+      nil ->
+        data
+
+      timer_ref ->
+        Process.cancel_timer(timer_ref)
+        %SubscriptionState{data | buffer_timers: Map.delete(buffer_timers, partition_key)}
+    end
+  end
+
+  defp clear_partition_timer(%SubscriptionState{} = data, partition_key) do
+    %SubscriptionState{buffer_timers: buffer_timers} = data
+    %SubscriptionState{data | buffer_timers: Map.delete(buffer_timers, partition_key)}
+  end
+
+  defp restart_timers_for_pending_partitions(%SubscriptionState{} = data) do
+    %SubscriptionState{partitions: partitions} = data
+
+    Enum.reduce(partitions, data, fn {partition_key, _pending_events}, acc ->
+      maybe_start_partition_timer(acc, partition_key)
+    end)
+  end
+
+  defp flush_partition_on_timeout(%SubscriptionState{} = data, partition_key) do
+    %SubscriptionState{partitions: partitions} = data
+
+    case Map.get(partitions, partition_key) do
+      nil ->
+        data
+
+      _pending_events ->
+        data = notify_partition_subscriber(data, partition_key)
+
+        case Map.get(data.partitions, partition_key) do
+          nil -> data
+          _remaining_events -> maybe_start_partition_timer(data, partition_key)
+        end
+    end
+  end
 end
